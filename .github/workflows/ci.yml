@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        # 20 is the floor declared in package.json engines; 22 is current LTS.
+        node-version: [20.x, 22.x]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm test
+
+  # The test suite deliberately never touches the network, so a missing key
+  # must not be what makes CI pass. This asserts the app refuses to start
+  # without configuration, which is the behaviour lib/config.js exists for.
+  startup-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - run: npm ci
+      - name: App exits with a clear error when unconfigured
+        run: |
+          if node index.js; then
+            echo "::error::Expected a non-zero exit with no configuration set"
+            exit 1
+          fi
+          node index.js 2>&1 | grep -q "Missing required configuration"

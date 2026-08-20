@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*service-account*.json
+credentials.json
+google-credentials.json
+
+# Personal context files (see MY_INFO in .env.example)
+MY_INFO.txt
+*_Context.md
+
+# Local reports and generated documents
+*Report.docx
+*Report.pdf
+
+# Editor and tooling
+.claude/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local scratch files (underscore prefix = throwaway, never committed)
+_*.js

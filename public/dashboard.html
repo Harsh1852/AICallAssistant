@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Call Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+
+<header>
+  <div class="logo"><div class="pulse"></div>Call Monitor</div>
+  <div style="display:flex;align-items:center;gap:14px">
+    <button class="btn-blocklist" onclick="openBlocklist()">🚫 Blocklist</button>
+    <div class="clock" id="clock"></div>
+  </div>
+</header>
+
+<main>
+  <div class="left">
+    <!-- Active calls -->
+    <div class="active-section">
+      <div class="section-label">
+        Live calls
+        <span class="count live" id="active-count">0</span>
+      </div>
+      <div class="call-list" id="active-list">
+        <div class="empty">No active calls</div>
+      </div>
+    </div>
+
+    <!-- Past calls: the last couple of hours from memory, then everything
+         older read back from the call log, in one scrolling list. -->
+    <div class="ended-section">
+      <div class="section-label">
+        Past calls
+        <span class="count" id="ended-count">0</span>
+      </div>
+      <div class="past-search">
+        <input type="text" id="history-search" class="history-search"
+               placeholder="Search caller number…" inputmode="tel" oninput="onHistorySearch()">
+      </div>
+      <div class="call-list" id="ended-list">
+        <div class="empty">No past calls yet.<br>They appear here after a call ends.</div>
+      </div>
+      <button class="btn-more" id="history-more" style="display:none" onclick="fetchHistory()">Load older calls</button>
+    </div>
+
+    <!-- Blocked calls -->
+    <div class="blocked-section">
+      <div class="section-label">
+        Blocked calls
+        <span class="count" id="blocked-count">0</span>
+      </div>
+      <div class="call-list" id="blocked-list">
+        <div class="empty">No blocked calls.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="right" id="right-panel">
+    <div class="detail-empty">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" opacity=".25">
+        <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/>
+      </svg>
+      Select a call to view its transcript
+    </div>
+  </div>
+</main>
+
+<div id="toast"></div>
+
+<div id="blocklist-modal" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeBlocklist()">
+  <div class="modal">
+    <div class="modal-header">
+      <span>Blocked Numbers</span>
+      <button class="modal-close" onclick="closeBlocklist()" title="Close" aria-label="Close blocklist">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="block-add-form">
+        <input type="text" id="block-number-input" placeholder="+1 555 123 4567">
+        <input type="text" id="block-reason-input" placeholder="Reason (optional)">
+        <button class="btn-block-add" onclick="addBlock()">Block</button>
+      </div>
+      <div id="blocklist-list"><div class="empty">Loading…</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+let selectedSid = null;
+let allActive   = [];
+let allEnded    = [];
+let allBlocked  = [];
+
+// Past calls read back from the Sheets log. Unlike the three lists above this
+// is NOT refreshed by poll() — it's fetched once at startup, again on each
+// search, and it accumulates as the user pages through. It shares the "Past
+// calls" list with allEnded, which holds the last couple of hours from memory.
+let allHistory     = [];
+let historyOffset  = 0;
+let historyQuery   = '';
+let historyLoading = false;
+let historyTimer   = null;
+// Shown under the list when the log itself has something to say (loading,
+// not configured, request failed) — kept out of the card markup so poll()'s
+// re-render doesn't wipe it.
+let historyNote    = '';
+let lastPastHtml   = null;
+
+// Tracks what's currently shown in the detail panel so polling only does a
+// full re-render (which replays the message fade-in animation, causing a
+// visible flash) when the transcript or status actually changed — otherwise
+// it just patches the live duration text in place.
+let lastRendered = { sid: null, transcriptLen: 0, status: null };
+
+// ── Clock ────────────────────────────────────────────────────────────────────
+setInterval(() => {
+  document.getElementById('clock').textContent =
+    new Date().toLocaleTimeString('en-US', { hour12: false });
+}, 1000);
+
+// ── Poll every 2 seconds ─────────────────────────────────────────────────────
+async function poll() {
+  try {
+    const res  = await fetch('/api/calls');
+    const data = await res.json();
+
+    allActive  = data.active || [];
+    const ended = data.ended || [];
+    allEnded   = ended.filter(c => c.status !== 'blocked');
+    allBlocked = ended.filter(c => c.status === 'blocked');
+
+    renderList('active-list',  allActive,  'active');
+    renderPast();
+    renderList('blocked-list', allBlocked, 'blocked');
+
+    document.getElementById('active-count').textContent  = allActive.length;
+    document.getElementById('blocked-count').textContent = allBlocked.length;
+
+    // Refresh detail panel if we're viewing a call — only fully re-render
+    // (which replays the fade-in animation on every message) when the
+    // transcript or status actually changed. Otherwise just patch the live
+    // duration text, so an unchanged conversation doesn't flash every poll.
+    if (selectedSid) {
+      const found =
+        allActive.find(c => c.callSid === selectedSid) ||
+        allEnded.find(c  => c.callSid === selectedSid) ||
+        allBlocked.find(c => c.callSid === selectedSid);
+      if (found) {
+        const changed =
+          found.callSid !== lastRendered.sid ||
+          found.transcript.length !== lastRendered.transcriptLen ||
+          found.status !== lastRendered.status;
+        if (changed) {
+          renderDetail(found);
+        } else {
+          updateDetailLiveStats(found);
+        }
+      }
+    }
+  } catch (_) {}
+}
+
+setInterval(poll, 2000);
+poll();
+
+// The log is only re-read on search or "Load older calls" — everything newer
+// arrives through poll() already.
+fetchHistory();
+
+// ── Render a call list ────────────────────────────────────────────────────────
+function renderList(elId, calls, type) {
+  const el = document.getElementById(elId);
+
+  if (calls.length === 0) {
+    el.innerHTML = type === 'active'
+      ? '<div class="empty">No active calls</div>'
+      : '<div class="empty">No blocked calls.</div>';
+    return;
+  }
+
+  el.innerHTML = calls.map(c => callCard(c, fmtTime(c.startTime))).join('');
+}
+
+function callCard(c, when) {
+  return `
+    <div class="call-card ${c.callSid === selectedSid ? 'selected' : ''}"
+         onclick="selectCall(${escArg(c.callSid)})">
+      <div class="call-card-top">
+        <span class="caller-num">${esc(fmt(c.callerNumber))}</span>
+        <span class="badge badge-${esc(c.status)}">${esc(badgeLabel(c))}</span>
+      </div>
+      <div class="call-meta">${when} · ${fmtDur(c.duration)} · ${c.transcript.length} turns</div>
+    </div>`;
+}
+
+// ── Past calls: recent + logged history in one list ───────────────────────────
+// Recent calls are still in memory and stay at the top; everything older comes
+// from the log. A call shouldn't be in both, but dedupe by sid in case the
+// two-hour handover window overlaps a fetch.
+function pastCalls() {
+  const recent = historyQuery ? allEnded.filter(matchesQuery) : allEnded;
+  const seen   = new Set(recent.map(c => c.callSid));
+  return recent.concat(allHistory.filter(c => !seen.has(c.callSid)));
+}
+
+// Caller number only, compared on digits so the search box accepts whatever
+// formatting the user types — matches how the server filters the older calls.
+function matchesQuery(c) {
+  const needle = historyQuery.replace(/\D/g, '');
+  if (!needle) return false;
+  return (c.callerNumber || '').replace(/\D/g, '').includes(needle);
+}
+
+function renderPast() {
+  const el    = document.getElementById('ended-list');
+  const calls = pastCalls();
+
+  document.getElementById('ended-count').textContent = calls.length;
+
+  // Dates rather than bare clock times: this list spans days once the log
+  // loads, so "7:03 PM" alone would be ambiguous.
+  const cards = calls.map(c => callCard(c, fmtDate(c.startTime))).join('');
+
+  const emptyMsg = historyQuery
+    ? `No calls from a number matching “${esc(historyQuery)}”.`
+    : 'No past calls yet.<br>They appear here after a call ends.';
+
+  const html =
+    (calls.length ? cards : `<div class="empty">${emptyMsg}</div>`) +
+    (historyNote ? `<div class="history-note">${historyNote}</div>` : '');
+
+  // poll() calls this every 2s, and rewriting innerHTML would jump this list
+  // back to the top mid-scroll — it can run to hundreds of logged calls.
+  if (html === lastPastHtml) return;
+  lastPastHtml = html;
+  el.innerHTML = html;
+}
+
+function badgeLabel(c) {
+  if (c.status === 'active')     return '● live';
+  if (c.status === 'taken-over') return 'taken over';
+  return c.outcome || 'ended';
+}
+
+// ── Select call ───────────────────────────────────────────────────────────────
+function selectCall(sid) {
+  selectedSid = sid;
+  const call =
+    allActive.find(c => c.callSid === sid) ||
+    allEnded.find(c  => c.callSid === sid) ||
+    allBlocked.find(c => c.callSid === sid) ||
+    allHistory.find(c => c.callSid === sid);
+  if (call) {
+    renderDetail(call);
+    document.querySelector('main').classList.add('mobile-detail-open');
+  }
+  renderList('active-list',  allActive,  'active');
+  renderPast();
+  renderList('blocked-list', allBlocked, 'blocked');
+}
+
+function closeDetail() {
+  selectedSid = null;
+  lastRendered = { sid: null, transcriptLen: 0, status: null };
+  document.querySelector('main').classList.remove('mobile-detail-open');
+  document.getElementById('right-panel').innerHTML = `
+    <div class="detail-empty">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" opacity=".25">
+        <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/>
+      </svg>
+      Select a call to view its transcript
+    </div>
+  `;
+  renderList('active-list',  allActive,  'active');
+  renderPast();
+  renderList('blocked-list', allBlocked, 'blocked');
+}
+
+// Patches just the live-changing duration text, avoiding a full re-render
+// (and its message fade-in replay) when nothing else has changed.
+function updateDetailLiveStats(call) {
+  const sub = document.getElementById('detail-sub');
+  if (sub) sub.textContent = detailSub(call);
+  const statDur = document.getElementById('stat-duration');
+  if (statDur) statDur.textContent = fmtDur(call.duration);
+}
+
+// ── Render detail ─────────────────────────────────────────────────────────────
+function renderDetail(call) {
+  const canTakeover = call.status === 'active';
+  const btnLabel    = canTakeover ? 'Take Over Call'
+                    : call.status === 'taken-over' ? 'You Took Over'
+                    : call.status === 'blocked' ? 'Rejected'
+                    : 'Call Ended';
+
+  document.getElementById('right-panel').innerHTML = `
+    <div class="detail-header">
+      <div>
+        <div class="detail-num">${esc(fmt(call.callerNumber))}</div>
+        <div class="detail-sub" id="detail-sub">${esc(detailSub(call))}</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <button class="btn-block" onclick="blockCaller(${escArg(call.callerNumber)})" ${call.callerNumber === 'unknown' || call.status === 'blocked' ? 'disabled' : ''}>${call.status === 'blocked' ? 'Blocked' : 'Block'}</button>
+        <button class="btn-takeover" id="tbtn" onclick="takeover(${escArg(call.callSid)})" ${canTakeover ? '' : 'disabled'}>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/>
+          </svg>
+          ${btnLabel}
+        </button>
+        <button class="modal-close" onclick="closeDetail()" title="Close" aria-label="Close call details">&times;</button>
+      </div>
+    </div>
+
+    <div class="transcript-wrap" id="tw">
+      ${call.transcript.length === 0
+        ? '<div style="color:var(--muted);font-size:13px;text-align:center;padding-top:32px">Waiting for conversation…</div>'
+        : call.transcript.map(t => `
+          <div class="msg ${t.speaker === 'AI' ? 'ai' : 'caller'}">
+            <div class="avatar ${t.speaker === 'AI' ? 'ai' : 'caller'}">${t.speaker === 'AI' ? 'AI' : 'C'}</div>
+            <div class="msg-body">
+              <div class="msg-label">${t.speaker === 'AI' ? 'AI Agent' : 'Caller'}</div>
+              <div class="msg-text">${esc(t.text)}</div>
+            </div>
+          </div>`).join('')}
+    </div>
+
+    <div class="stats-bar">
+      <div class="stat">Status: <span>${esc(call.status)}</span></div>
+      <div class="stat">Duration: <span id="stat-duration">${fmtDur(call.duration)}</span></div>
+      <div class="stat">Exchanges: <span>${call.transcript.length}</span></div>
+      ${call.outcome ? `<div class="stat">Outcome: <span>${esc(call.outcome)}</span></div>` : ''}
+    </div>
+  `;
+
+  const tw = document.getElementById('tw');
+  if (tw) tw.scrollTop = tw.scrollHeight;
+
+  lastRendered = { sid: call.callSid, transcriptLen: call.transcript.length, status: call.status };
+}
+
+// ── Take over ─────────────────────────────────────────────────────────────────
+async function takeover(sid) {
+  const btn = document.getElementById('tbtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Connecting…'; }
+
+  try {
+    const res  = await fetch('/api/takeover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callSid: sid }),
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast('✅ Handoff announced — connecting you now', 'success');
+    } else {
+      showToast('❌ ' + data.error, 'error');
+      if (btn) { btn.disabled = false; btn.textContent = 'Take Over Call'; }
+    }
+  } catch {
+    showToast('❌ Network error', 'error');
+    if (btn) { btn.disabled = false; btn.textContent = 'Take Over Call'; }
+  }
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+function showToast(msg, type) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = type;
+  t.style.display = 'block';
+  setTimeout(() => { t.style.display = 'none'; }, 4000);
+}
+
+// ── Blocklist ─────────────────────────────────────────────────────────────────
+function openBlocklist() {
+  document.getElementById('blocklist-modal').style.display = 'flex';
+  loadBlocklist();
+}
+function closeBlocklist() {
+  document.getElementById('blocklist-modal').style.display = 'none';
+}
+
+async function loadBlocklist() {
+  const el = document.getElementById('blocklist-list');
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const res  = await fetch('/api/blocklist');
+    const data = await res.json();
+    renderBlocklist(data.blocked || []);
+  } catch {
+    el.innerHTML = '<div class="empty">Couldn\'t load blocklist.</div>';
+  }
+}
+
+function renderBlocklist(blocked) {
+  const el = document.getElementById('blocklist-list');
+  if (blocked.length === 0) {
+    el.innerHTML = '<div class="empty">No numbers blocked.</div>';
+    return;
+  }
+  el.innerHTML = blocked.map(b => `
+    <div class="block-row">
+      <div>
+        <div class="caller-num">${esc(fmt(b.raw))}</div>
+        ${b.reason ? `<div class="call-meta">${esc(b.reason)}</div>` : ''}
+      </div>
+      <button class="btn-unblock" onclick="removeBlock(${escArg(b.raw)})">Remove</button>
+    </div>
+  `).join('');
+}
+
+async function addBlock() {
+  const numberInput = document.getElementById('block-number-input');
+  const reasonInput = document.getElementById('block-reason-input');
+  const number = numberInput.value.trim();
+  if (!number) return;
+
+  try {
+    const res  = await fetch('/api/blocklist', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ number, reason: reasonInput.value.trim() }),
+    });
+    const data = await res.json();
+    if (data.success) {
+      numberInput.value = '';
+      reasonInput.value = '';
+      showToast('🚫 Number blocked', 'success');
+      loadBlocklist();
+    } else {
+      showToast('❌ ' + data.error, 'error');
+    }
+  } catch {
+    showToast('❌ Network error', 'error');
+  }
+}
+
+async function removeBlock(number) {
+  try {
+    const res  = await fetch('/api/blocklist/remove', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ number }),
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast('✅ Number unblocked', 'success');
+      loadBlocklist();
+    } else {
+      showToast('❌ ' + data.error, 'error');
+    }
+  } catch {
+    showToast('❌ Network error', 'error');
+  }
+}
+
+async function blockCaller(number) {
+  if (!confirm(`Block ${fmt(number)}? Future calls from this number will be rejected automatically.`)) return;
+  try {
+    const res  = await fetch('/api/blocklist', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ number, reason: 'Blocked from call view' }),
+    });
+    const data = await res.json();
+    showToast(data.success ? '🚫 Number blocked' : '❌ ' + data.error, data.success ? 'success' : 'error');
+  } catch {
+    showToast('❌ Network error', 'error');
+  }
+}
+
+// ── History (older calls, read back from the log) ─────────────────────────────
+function resetHistory() {
+  allHistory    = [];
+  historyOffset = 0;
+  historyNote   = 'Loading older calls…';
+  document.getElementById('history-more').style.display = 'none';
+  renderPast();
+}
+
+// Older calls are re-queried on the server rather than filtered client-side,
+// since only the current page is in memory — debounced so typing doesn't fire
+// a request per keystroke. Recent calls are filtered in place by pastCalls(),
+// so the top of the list narrows immediately.
+function onHistorySearch() {
+  historyQuery = document.getElementById('history-search').value.trim();
+  renderPast();
+
+  clearTimeout(historyTimer);
+  historyTimer = setTimeout(() => {
+    resetHistory();
+    fetchHistory();
+  }, 300);
+}
+
+async function fetchHistory() {
+  if (historyLoading) return;
+  historyLoading = true;
+
+  const moreEl = document.getElementById('history-more');
+  moreEl.textContent = 'Loading…';
+
+  try {
+    const params = new URLSearchParams({ limit: 50, offset: historyOffset, q: historyQuery });
+    const res    = await fetch('/api/calls/history?' + params);
+    const data   = await res.json();
+
+    if (data.configured === false) {
+      // Recent calls still work without the log, so this is a note under the
+      // list rather than an error in place of it.
+      historyNote = 'Older calls need GOOGLE_SHEET_ID and Google credentials configured.';
+      return;
+    }
+    if (data.error) {
+      historyNote = 'Couldn\'t load older calls. ' + esc(data.error);
+      return;
+    }
+
+    allHistory    = allHistory.concat(data.calls || []);
+    historyOffset = allHistory.length;
+    historyNote   = '';
+
+    moreEl.style.display = data.hasMore ? 'block' : 'none';
+  } catch {
+    historyNote = 'Network error loading older calls.';
+  } finally {
+    historyLoading = false;
+    moreEl.textContent = 'Load older calls';
+    renderPast();
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function fmt(n) {
+  if (!n || n === 'unknown') return 'Unknown';
+  const d = n.replace(/\D/g, '');
+  if (d.length === 11 && d[0] === '1')
+    return `+1 (${d.slice(1,4)}) ${d.slice(4,7)}-${d.slice(7)}`;
+  return n;
+}
+function fmtDur(s) {
+  const m = Math.floor(s / 60), sec = s % 60;
+  return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+}
+function fmtTime(t) {
+  if (!t) return '';
+  return new Date(t).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+}
+// History spans days, so a bare clock time would be ambiguous there.
+function fmtDate(t) {
+  if (!t) return '';
+  return new Date(t).toLocaleString('en-US', {
+    month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  });
+}
+// The detail panel is also used for history calls, so date as well as clock time.
+function detailSub(call) {
+  const when = fmtDate(call.startTime);
+  return `${when ? when + ' · ' : ''}${fmtDur(call.duration)} · ${call.transcript.length} exchanges · ${call.status}`;
+}
+// Escapes quotes as well as angle brackets, so the same helper is safe inside
+// a quoted attribute and not just in text content. Values reaching these
+// templates are not all trustworthy: blocklist entries and call outcomes come
+// from a hand-editable Google Sheet, and caller-supplied text passes through
+// the transcript.
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// For a value interpolated into a single-quoted JS string inside an onclick
+// attribute, where HTML-escaping alone still leaves a usable backslash or
+// newline. JSON-encoding it first neutralises those, then esc() makes it safe
+// for the surrounding attribute.
+function escArg(s) {
+  return esc(JSON.stringify(String(s == null ? '' : s)));
+}
+
+// Auto-select from URL param
+const sid = new URLSearchParams(location.search).get('sid');
+if (sid) setTimeout(() => selectCall(sid), 500);
+</script>
+</body>
+</html>

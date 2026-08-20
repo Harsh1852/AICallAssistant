@@ -1,0 +1,48 @@
+{
+  "name": "ai-phone-agent",
+  "version": "3.0.0",
+  "description": "Self-hosted AI phone receptionist: answers calls with Twilio and an LLM, books appointments on Google Calendar, logs transcripts to Google Sheets, and lets you take over a live call from a web dashboard.",
+  "main": "index.js",
+  "license": "MIT",
+  "author": "Harsh Sharma",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Harsh1852/AICallAssistant.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Harsh1852/AICallAssistant/issues"
+  },
+  "homepage": "https://github.com/Harsh1852/AICallAssistant#readme",
+  "keywords": [
+    "twilio",
+    "voice",
+    "ivr",
+    "ai-agent",
+    "llm",
+    "openai",
+    "groq",
+    "receptionist",
+    "voice-assistant",
+    "appointment-booking",
+    "google-calendar",
+    "self-hosted"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "googleapis": "^173.0.0",
+    "openai": "^4.65.0",
+    "twilio": "^5.3.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
+  }
+}
